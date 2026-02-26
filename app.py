@@ -5,112 +5,81 @@ from PIL import Image
 from rembg import remove
 import io
 import zipfile
-import time
 
-# --- 1. 自动提取参考图颜色 ---
-def extract_target_color(reference_img):
-    # 将 PIL 转为 OpenCV 格式
-    img = np.array(reference_img.convert('RGB'))
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
-    
-    # 取图片中心区域的平均颜色，避免边缘背景干扰
-    h, w, _ = img.shape
-    roi = img[h//3:2*h//3, w//3:2*w//3]
-    avg_hsv = cv2.mean(roi)
-    return avg_hsv[0] # 返回提取到的 H (色相) 值
+# --- 核心算法：Lab空间色彩转换 (自动匹配，无需微调) ---
+def color_transfer(source, target):
+    # 将图片转为 Lab 空间（更能模拟人类视觉，对黑白变色更友好）
+    source_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype("float32")
+    target_lab = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype("float32")
 
-# --- 2. 核心处理函数：换色 + 质感保留 + 肤色保护 ---
-def process_advanced_color(original_img, target_hue, s_weight, v_weight):
-    # AI 自动扣图 (获取主体 Mask)
-    no_bg_img = remove(original_img)
-    no_bg_array = np.array(no_bg_img)
-    subject_mask = no_bg_array[:, :, 3] 
+    # 计算参考图(source)和原图(target)的均值和标准差
+    (l_mean_src, l_std_src, a_mean_src, a_std_src, b_mean_src, b_std_src) = cv2.meanStdDev(source_lab)
+    (l_mean_tar, l_std_tar, a_mean_tar, a_std_tar, b_mean_tar, b_std_tar) = cv2.meanStdDev(target_lab)
 
-    # 转换原图到 HSV
+    # 分离通道
+    (l, a, b) = cv2.split(target_lab)
+
+    # 执行颜色迁移：让原图的分布贴近参考图
+    l = ((l - l_mean_tar) * (l_std_src / (l_std_tar + 1e-5))) + l_mean_src
+    a = ((a - a_mean_tar) * (a_std_src / (a_std_tar + 1e-5))) + a_mean_src
+    b = ((b - b_mean_tar) * (b_std_src / (b_std_tar + 1e-5))) + b_mean_src
+
+    # 裁剪范围并转换回 BGR
+    transfer = cv2.merge([l, a, b])
+    transfer = np.clip(transfer, 0, 255).astype("uint8")
+    transfer = cv2.cvtColor(transfer, cv2.COLOR_LAB2BGR)
+    return transfer
+
+def process_auto_match(original_img, ref_img):
+    # 1. AI 抠图
+    no_bg = remove(original_img)
+    mask = np.array(no_bg)[:, :, 3]
     rgb_img = np.array(original_img.convert('RGB'))
-    hsv_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV)
+    bgr_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
+
+    # 2. 准备参考图
+    ref_bgr = cv2.cvtColor(np.array(ref_img.convert('RGB')), cv2.COLOR_RGB2BGR)
     
-    # --- 肤色保护逻辑 ---
-    # 定义典型的肤色 HSV 范围
+    # 3. 肤色检测 (保护脸部细节)
+    hsv = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV)
     lower_skin = np.array([0, 20, 70], dtype=np.uint8)
     upper_skin = np.array([25, 255, 255], dtype=np.uint8)
-    skin_mask = cv2.inRange(hsv_img, lower_skin, upper_skin)
+    skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
     
-    # 衣服区域 = (扣图主体) 排除 (皮肤区域)
-    clothes_mask = cv2.bitwise_and(subject_mask, cv2.bitwise_not(skin_mask))
-    # 羽化蒙版边缘，让颜色过渡更自然
-    clothes_mask = cv2.GaussianBlur(clothes_mask, (7, 7), 0)
+    # 衣服蒙版 = 主体 - 皮肤
+    clothes_mask = cv2.bitwise_and(mask, cv2.bitwise_not(skin_mask))
+    clothes_mask = cv2.GaussianBlur(clothes_mask, (5, 5), 0) / 255.0
 
-    # --- 质感保留变色 ---
-    hsv_float = hsv_img.astype(np.float32)
-    h, s, v = cv2.split(hsv_float)
-    
-    # 关键：只替换 H (色相)，保留原图的 V (亮度/质感)
-    h[:] = target_hue
-    s = np.clip(s * s_weight, 0, 255) # 调节饱和度
-    v = np.clip(v * v_weight, 0, 255) # 调节明暗
-    
-    processed_hsv = cv2.merge((h, s, v)).astype(np.uint8)
-    processed_rgb = cv2.cvtColor(processed_hsv, cv2.COLOR_HSV2RGB)
-    
-    # --- 最终合成 ---
-    alpha = clothes_mask[:, :, np.newaxis] / 255.0
-    # 结果 = 新颜色图 * 衣服蒙版 + 原图 * (1 - 衣服蒙版)
-    final_img = (processed_rgb * alpha + rgb_img * (1 - alpha)).astype(np.uint8)
-    return final_img
+    # 4. 执行颜色自动克隆
+    matched_bgr = color_transfer(ref_bgr, bgr_img)
+    matched_rgb = cv2.cvtColor(matched_bgr, cv2.COLOR_BGR2RGB)
 
-# --- 3. Streamlit 网页界面 ---
-st.set_page_config(page_title="高级服装换色系统", layout="wide")
-st.title("👕 AI 服装智能换色 (参考图取色版)")
+    # 5. 合成
+    alpha = clothes_mask[:, :, np.newaxis]
+    final = (matched_rgb * alpha + rgb_img * (1 - alpha)).astype(np.uint8)
+    return final
+
+# --- 简化版网页界面 ---
+st.set_page_config(page_title="AI全自动换色器", layout="wide")
+st.title("👕 AI 全自动服装颜色克隆")
+st.markdown("只需上传参考图，系统将自动匹配颜色与质感，无需手动调节。")
 
 with st.sidebar:
-    st.header("1️⃣ 第一步：参考色提取")
-    ref_file = st.file_uploader("上传参考图/色卡", type=['jpg', 'png', 'jpeg'])
-    
-    target_h = 120 # 默认蓝色
+    st.header("1. 上传颜色参考图")
+    ref_file = st.file_uploader("此图颜色将作为目标色", type=['jpg', 'png', 'jpeg'])
     if ref_file:
-        ref_img = Image.open(ref_file)
-        target_h = extract_target_color(ref_img)
-        st.image(ref_img, caption="已提取此图颜色", width=150)
-        st.success(f"已自动匹配色调: {int(target_h)}")
+        st.image(ref_file, caption="目标颜色参考", use_container_width=True)
 
-    st.header("2️⃣ 第二步：参数微调")
-    s_val = st.slider("饱和度 (颜色浓淡)", 0.0, 2.0, 1.0)
-    v_val = st.slider("明亮度 (深浅质感)", 0.0, 2.0, 1.0)
-    st.info("💡 提示：即便上传了参考图，你依然可以微调颜色深浅。")
-
-# 主界面：图片上传
-st.subheader("3️⃣ 第三步：上传需要变色的服装照片")
+st.header("2. 上传待换色照片")
 uploaded_files = st.file_uploader("支持批量上传", type=['jpg', 'png', 'jpeg'], accept_multiple_files=True)
 
-if uploaded_files:
-    if st.button("🚀 开始 AI 换色处理"):
-        processed_images = []
+if uploaded_files and ref_file:
+    if st.button("🚀 开始全自动克隆颜色"):
+        ref_img = Image.open(ref_file)
         cols = st.columns(2)
-        progress = st.progress(0)
-        
         for idx, file in enumerate(uploaded_files):
-            # 处理
-            img = Image.open(file)
-            res = process_advanced_color(img, target_h, s_val, v_val)
-            processed_images.append({"name": file.name, "img": res})
-            
-            # 显示
+            res = process_auto_match(Image.open(file), ref_img)
             with cols[idx % 2]:
-                st.image(res, caption=f"处理结果: {file.name}", use_container_width=True)
-            progress.progress((idx + 1) / len(uploaded_files))
-            
-        # 批量打包下载
-        zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, "w") as zf:
-            for item in processed_images:
-                img_io = io.BytesIO()
-                Image.fromarray(item["img"]).save(img_io, format='JPEG', quality=95)
-                zf.writestr(f"new_{item['name']}", img_io.getvalue())
-        
-        st.download_button(
-            label="📦 点击下载全部处理好的图片 (ZIP)",
-            data=zip_buf.getvalue(),
-            file_name="clothes_results.zip",
-            mime="application/zip"
-        )
+                st.image(res, caption=f"自动匹配结果: {file.name}", use_container_width=True)
+else:
+    st.warning("请确保同时上传了【参考图】和【待换色图】")
