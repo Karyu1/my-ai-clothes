@@ -3,112 +3,87 @@ import cv2
 import numpy as np
 from PIL import Image
 from rembg import remove
-import io, zipfile
+import io
+import zipfile
+import time
 
-# --- 1. 颜色精准采样 ---
-def get_target_lab(ref_img):
-    img = np.array(ref_img.convert('RGB'))
-    h, w, _ = img.shape
-    # 取中心 20% 区域，避开边缘
-    roi = img[int(h*0.4):int(h*0.6), int(w*0.4):int(w*0.6)]
-    avg_rgb = np.mean(roi, axis=(0, 1)).astype(np.uint8)
-    # 转为 LAB
-    target_lab = cv2.cvtColor(np.uint8([[avg_rgb]]), cv2.COLOR_RGB2LAB)[0][0]
-    return target_lab
+# --- 1. 自动提取参考图颜色 ---
+def extract_target_color(reference_img):
+    img = np.array(reference_img.convert('RGB'))
+    img_hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+    h, w, _ = img_hsv.shape
+    roi = img_hsv[h//3:2*h//3, w//3:2*w//3]
+    avg_hsv = cv2.mean(roi)
+    return avg_hsv[0], avg_hsv[1], avg_hsv[2] # 返回 H, S, V
 
-# --- 2. 核心算法：补光 + 语义保护 ---
-def process_core(original_img, target_lab):
-    # 转为数组并记录尺寸
+# --- 2. 核心处理函数：支持黑色服装变色 ---
+def process_advanced_color(original_img, t_h, t_s, t_v, s_weight, v_weight):
+    # AI 自动扣图
+    no_bg_img = remove(original_img)
+    no_bg_array = np.array(no_bg_img)
+    subject_mask = no_bg_array[:, :, 3] 
+
+    # 转换原图到 HSV
     rgb_img = np.array(original_img.convert('RGB'))
-    h, w, _ = rgb_img.shape
+    hsv_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV).astype(np.float32)
+    h, s, v = cv2.split(hsv_img)
     
-    # A. 提取主体掩模
-    mask = np.array(remove(original_img, only_mask=True))
+    # --- 肤色保护 ---
+    lower_skin = np.array([0, 20, 70], dtype=np.uint8)
+    upper_skin = np.array([25, 255, 255], dtype=np.uint8)
+    hsv_uint8 = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV)
+    skin_mask = cv2.inRange(hsv_uint8, lower_skin, upper_skin)
+    clothes_mask = cv2.bitwise_and(subject_mask, cv2.bitwise_not(skin_mask))
+    clothes_mask = cv2.GaussianBlur(clothes_mask, (7, 7), 0) / 255.0
 
-    # B. 【建立多层防护罩】
-    # 1. 皮肤防护 (YCrCb 空间最稳)
-    ycrcb = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2YCrCb)
-    skin = cv2.inRange(ycrcb, (0, 135, 85), (255, 180, 135))
-    skin = cv2.dilate(skin, np.ones((5,5), np.uint8), iterations=2)
+    # --- 针对黑色衣服的特殊算法 ---
+    # 1. 提取目标色相
+    h[:] = t_h
+    
+    # 2. 强制提升饱和度 (解决黑色无色问题)
+    # 如果原图饱和度低，则使用参考图的饱和度乘以权重
+    s = np.where(s < 50, t_s * s_weight, s * s_weight)
+    s = np.clip(s, 0, 255)
+    
+    # 3. 提升明亮度 (解决黑色太暗无法上色问题)
+    # 黑色衣服如果不提亮，颜色是染不上去的。我们保留纹理的同时拉高亮度。
+    v_boost = np.where(v < 100, v + (255 - v) * 0.4 * v_weight, v * v_weight)
+    v = np.clip(v_boost, 0, 255)
+    
+    processed_hsv = cv2.merge((h, s, v)).astype(np.uint8)
+    processed_rgb = cv2.cvtColor(processed_hsv, cv2.COLOR_HSV2RGB)
+    
+    # --- 最终合成 ---
+    alpha = clothes_mask[:, :, np.newaxis]
+    final_img = (processed_rgb * alpha + rgb_img * (1 - alpha)).astype(np.uint8)
+    return final_img
 
-    # 2. 中性色防护 (针对白鞋、灰色器材)
-    hsv = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV)
-    saturation = hsv[:, :, 1]
-    neutral = cv2.threshold(saturation, 45, 255, cv2.THRESH_BINARY_INV)[1]
-
-    # 3. 底部防护 (保护鞋子：图片底部 15% 区域不准变色)
-    bottom_shield = np.ones((h, w), dtype=np.uint8) * 255
-    bottom_shield[int(h*0.85):, :] = 0 
-
-    # 合成服装掩模
-    clothes_mask = cv2.bitwise_and(mask, cv2.bitwise_not(skin))
-    clothes_mask = cv2.bitwise_and(clothes_mask, cv2.bitwise_not(neutral))
-    clothes_mask = cv2.bitwise_and(clothes_mask, bottom_shield)
-    clothes_mask_blur = cv2.GaussianBlur(clothes_mask, (15, 15), 0) / 255.0
-
-    # C. 【黑色补光与色彩映射】
-    lab = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2LAB).astype(np.float32)
-    l, a, b = cv2.split(lab)
-
-    # 黑色上色逻辑：如果亮度(L)太低，强制提升
-    target_l = target_lab[0]
-    # 对暗部进行非线性亮度提升
-    l_fixed = np.where(l < 70, l * 0.4 + (target_l * 0.6), l)
-    l_fixed = np.clip(l_fixed, 0, 255)
-
-    # 颜色克隆
-    a_new = np.full_like(a, target_lab[1])
-    b_new = np.full_like(b, target_lab[2])
-
-    # 合成
-    merged_lab = cv2.merge([l_fixed, a_new, b_new]).astype(np.uint8)
-    new_rgb = cv2.cvtColor(merged_lab, cv2.COLOR_LAB2RGB)
-
-    # D. 最终融合
-    m = clothes_mask_blur[:, :, np.newaxis]
-    final = (new_rgb * m + rgb_img * (1 - m)).astype(np.uint8)
-    return final
-
-# --- 3. Streamlit 界面 ---
-st.set_page_config(page_title="AI 换色专业版", layout="wide")
-st.title("👕 AI 服装 1:1 复刻系统 (稳健版)")
+# --- 3. UI 界面 ---
+st.set_page_config(page_title="黑色服装专项换色", layout="wide")
+st.title("👕 AI 服装换色 (黑色/深色服装专项版)")
 
 with st.sidebar:
-    st.header("1. 参考颜色")
-    ref_file = st.file_uploader("上传色卡/参考图", type=['jpg', 'png', 'jpeg'])
+    st.header("1️⃣ 参考图上传")
+    ref_file = st.file_uploader("上传目标颜色参考图", type=['jpg', 'png', 'jpeg'])
+    
+    t_h, t_s, t_v = 120, 150, 150 # 默认值
     if ref_file:
         ref_img = Image.open(ref_file)
-        st.image(ref_img, caption="提取源")
-        t_lab = get_target_lab(ref_img)
-        st.success("颜色已锁定")
+        t_h, t_s, t_v = extract_target_color(ref_img)
+        st.image(ref_img, caption="提取颜色成功", width=150)
 
-st.header("2. 待变色图片")
-files = st.file_uploader("支持批量上传", type=['jpg', 'png', 'jpeg'], accept_multiple_files=True)
+    st.header("2️⃣ 黑色服装微调")
+    st.write("如果是黑色衣服，请调大下方两个参数：")
+    s_weight = st.slider("饱和度补偿", 0.0, 3.0, 1.5)
+    v_weight = st.slider("明亮度补偿", 0.0, 3.0, 1.2)
 
-if files and ref_file:
-    if st.button("🚀 开始处理"):
-        t_lab = get_target_lab(Image.open(ref_file))
+st.subheader("3️⃣ 上传需要换色的照片")
+uploaded_files = st.file_uploader("支持批量上传", type=['jpg', 'png', 'jpeg'], accept_multiple_files=True)
+
+if uploaded_files:
+    if st.button("🚀 开始 AI 换色"):
         cols = st.columns(2)
-        results = []
-        
-        for idx, f in enumerate(files):
-            try:
-                # 核心处理，添加错误捕获防止程序崩溃
-                img = Image.open(f).convert('RGB')
-                res = process_core(img, t_lab)
-                results.append({"name": f.name, "img": res})
-                with cols[idx % 2]:
-                    st.image(res, caption=f"结果: {f.name}", use_container_width=True)
-            except Exception as e:
-                st.error(f"跳过错误文件 {f.name}: {str(e)}")
-
-        if results:
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, "w") as z:
-                for r in results:
-                    img_io = io.BytesIO()
-                    Image.fromarray(r["img"]).save(img_io, format='JPEG', quality=95)
-                    z.writestr(f"fixed_{r['name']}", img_io.getvalue())
-            st.download_button("💾 下载全部结果", buf.getvalue(), "output.zip")
-else:
-    st.info("请先上传参考图和待变色照片。")
+        for idx, file in enumerate(uploaded_files):
+            res = process_advanced_color(Image.open(file), t_h, t_s, t_v, s_weight, v_weight)
+            with cols[idx % 2]:
+                st.image(res, caption=f"处理结果: {file.name}", use_container_width=True)
