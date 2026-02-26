@@ -9,104 +9,106 @@ import io, zipfile
 def get_ref_color_precise(ref_img):
     img = np.array(ref_img.convert('RGB'))
     h, w, _ = img.shape
-    # 采样中心 100x100 区域避免背景色干扰
-    roi = img[h//2-50:h//2+50, w//2-50:w//2+100]
+    # 缩小采样窗口，只取中心颜色，防止采样到边框
+    roi = img[int(h*0.4):int(h*0.6), int(w*0.4):int(w*0.6)]
     return np.mean(roi, axis=(0, 1))
 
-# --- 2. 核心算法：高保元换色 ---
-def process_perfect_match(original_img, target_rgb):
-    # 转为数组
+# --- 2. 核心算法：语义保护 + 边缘净化 ---
+def process_professional_transfer(original_img, target_rgb):
+    # 图像预处理
     rgb_img = np.array(original_img.convert('RGB'))
+    bgr_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
     
-    # A. 剥离背景
-    no_bg = remove(original_img)
-    subject_mask = np.array(no_bg)[:, :, 3]
+    # A. AI 主体剥离 (初步过滤背景)
+    with st.spinner("正在定位服装区域..."):
+        no_bg = remove(original_img, only_mask=True)
+        subject_mask = np.array(no_bg)
 
-    # B. 【人脸/皮肤绝对防御】
-    # 结合 HSV 和 YCrCb 两种空间识别人脸，防止变色
-    hsv = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV)
-    ycrcb = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2YCrCb)
-    
-    # HSV 范围
-    lower_hsv = np.array([0, 10, 40], dtype=np.uint8)
-    upper_hsv = np.array([30, 255, 255], dtype=np.uint8)
-    mask_hsv = cv2.inRange(hsv, lower_hsv, upper_hsv)
-    
-    # YCrCb 范围 (识别人脸精准度极高)
-    mask_ycrcb = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
-    
-    # 合并皮肤掩模并向外大幅膨胀，确保脖子/发际线边缘不留绿边
-    skin_mask = cv2.bitwise_or(mask_hsv, mask_ycrcb)
-    skin_mask = cv2.dilate(skin_mask, np.ones((9, 9), np.uint8), iterations=2)
+    # B. 【精准肤色锁定】使用 YCrCb 排除人像
+    ycrcb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2YCrCb)
+    # 皮肤在 YCrCb 的典型分布范围
+    skin_mask = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
+    # 适当扩张皮肤掩模，确保边缘不漏色
+    skin_mask = cv2.dilate(skin_mask, np.ones((7, 7), np.uint8), iterations=2)
 
-    # C. 生成服装纯净掩模
+    # C. 【道具与背景排除】
+    # 利用原图的色彩饱和度和对比度，识别非衣物区域（如白色鞋子、灰色道具）
+    gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
+    _, white_mask = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY) # 排除纯白物体（如白鞋）
+    _, black_mask = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY_INV) # 排除纯黑道具
+    
+    # D. 生成最终纯净服装掩模
+    # 原理：主体区域 - 皮肤 - 白色物体 - 黑色物体
     clothes_mask = cv2.bitwise_and(subject_mask, cv2.bitwise_not(skin_mask))
-    clothes_mask = cv2.GaussianBlur(clothes_mask, (15, 15), 0) / 255.0
+    clothes_mask = cv2.bitwise_and(clothes_mask, cv2.bitwise_not(white_mask))
+    clothes_mask = cv2.bitwise_and(clothes_mask, cv2.bitwise_not(black_mask))
+    
+    # 净化边缘：通过形态学处理消除“毛刺”和“杂色边”
+    kernel = np.ones((5, 5), np.uint8)
+    clothes_mask = cv2.morphologyEx(clothes_mask, cv2.MORPH_OPEN, kernel)
+    clothes_mask_blur = cv2.GaussianBlur(clothes_mask, (11, 11), 0) / 255.0
 
-    # D. 【1:1 颜色克隆算法】
-    # 使用 HSV 偏移 + 亮度对齐，保留 1:1 的颜色和褶皱细节
+    # E. 【高保真 1:1 换色逻辑】
     target_hsv = cv2.cvtColor(np.uint8([[target_rgb]]), cv2.COLOR_RGB2HSV)[0][0]
+    hsv_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV).astype(np.float32)
     
-    # 转换原图到浮点 HSV
-    hsv_float = hsv.astype(np.float32)
+    # 强制克隆 H(色相) 和 S(饱和度)
+    hsv_img[:, :, 0] = target_hsv[0]
+    hsv_img[:, :, 1] = target_hsv[1]
     
-    # 强制将 H(色相) 和 S(饱和度) 设置为参考色
-    hsv_float[:, :, 0] = target_hsv[0] # H
-    hsv_float[:, :, 1] = target_hsv[1] # S
+    # 优化 V(明度) 通道：保留褶皱的同时，让暗部更有质感
+    v = hsv_img[:, :, 2]
+    v = cv2.normalize(v, None, alpha=max(50, target_hsv[2]-100), beta=min(255, target_hsv[2]+50), norm_type=cv2.NORM_MINMAX)
+    hsv_img[:, :, 2] = v
     
-    # 亮度(V) 通道特殊处理：保留原图纹理，但提升黑色衣服的整体亮度
-    v_chan = hsv_float[:, :, 2]
-    # 对亮度进行非线性提升，让颜色更通透不发灰
-    v_chan = np.where(v_chan < 128, v_chan * 1.2, v_chan)
-    hsv_float[:, :, 2] = np.clip(v_chan, 0, 255)
-    
-    new_rgb = cv2.cvtColor(hsv_float.astype(np.uint8), cv2.COLOR_HSV2RGB)
+    new_rgb = cv2.cvtColor(hsv_img.astype(np.uint8), cv2.COLOR_HSV2RGB)
 
-    # E. 最终合成
-    m = clothes_mask[:, :, np.newaxis]
-    # 对衣服区域应用新颜色，其余完全保留原图
+    # F. 最终无损合成
+    m = clothes_mask_blur[:, :, np.newaxis]
+    # 对衣物应用换色，其他部分（鞋子、脸、道具）100% 保持原样
     final = (new_rgb * m + rgb_img * (1 - m)).astype(np.uint8)
     return final
 
-# --- 3. UI 界面 ---
-st.set_page_config(page_title="AI精准服装换色", layout="wide")
-st.title("👕 AI 1:1 颜色克隆 (专业修复版)")
+# --- 3. Streamlit 交互界面 ---
+st.set_page_config(page_title="专业服装换色系统", layout="wide")
+st.title("👔 专业级服装换色 (已修复道具/边缘杂色问题)")
+st.markdown("---")
 
+# 侧边栏：配置区
 with st.sidebar:
-    st.header("1. 参考颜色图")
-    ref_file = st.file_uploader("上传色卡或颜色样板", type=['jpg', 'png', 'jpeg'])
+    st.header("1. 参考颜色配置")
+    ref_file = st.file_uploader("上传参考色图", type=['jpg', 'png', 'jpeg'])
     if ref_file:
         ref_img = Image.open(ref_file)
-        st.image(ref_img, caption="参考色预览", width=200)
-        t_rgb = get_ref_color_precise(ref_img)
-        st.success(f"已锁定参考色: {int(t_rgb[0])}, {int(t_rgb[1])}, {int(t_rgb[2])}")
+        st.image(ref_img, caption="参考色源")
+        target_rgb = get_ref_color_precise(ref_img)
+        st.success("颜色锁定成功")
 
-st.header("2. 待换色照片 (上传后可直接在此预览)")
-uploaded_files = st.file_uploader("支持批量上传 (jpg/png)", type=['jpg', 'png', 'jpeg'], accept_multiple_files=True)
+# 主界面：上传与预览
+st.header("2. 待换色照片上传")
+uploaded_files = st.file_uploader("支持批量上传 (将自动排除鞋子/道具)", type=['jpg', 'png', 'jpeg'], accept_multiple_files=True)
 
-# 照片预览功能
 if uploaded_files:
-    with st.expander("🖼️ 点击预览已上传的照片", expanded=True):
+    with st.expander("🔍 预览已上传的原图"):
         cols = st.columns(5)
         for i, f in enumerate(uploaded_files):
             with cols[i % 5]:
-                st.image(f, caption=f"原图 {i+1}", use_container_width=True)
+                st.image(f, use_container_width=True)
 
-# 处理逻辑
 if uploaded_files and ref_file:
-    if st.button("🚀 开始 AI 精准颜色复刻"):
+    if st.button("🚀 开始精准换色处理"):
         t_rgb = get_ref_color_precise(Image.open(ref_file))
         res_cols = st.columns(2)
         zip_list = []
         
         for idx, file in enumerate(uploaded_files):
             try:
-                res = process_perfect_match(Image.open(file), t_rgb)
+                res = process_professional_transfer(Image.open(file), t_rgb)
                 zip_list.append({"name": file.name, "img": res})
                 with res_cols[idx % 2]:
-                    st.image(res, caption=f"复刻结果: {file.name}", use_container_width=True)
+                    st.image(res, caption=f"处理结果: {file.name}", use_container_width=True)
             except Exception as e:
-                st.error(f"处理第 {idx+1} 张图出错: {e}")
+                st.error(f"处理出错: {file.name}")
 
         if zip_list:
             buf = io.BytesIO()
@@ -114,7 +116,7 @@ if uploaded_files and ref_file:
                 for item in zip_list:
                     img_io = io.BytesIO()
                     Image.fromarray(item["img"]).save(img_io, format='JPEG', quality=95)
-                    f.writestr(f"cloned_{item['name']}", img_io.getvalue())
-            st.download_button("💾 下载所有结果 (ZIP)", buf.getvalue(), "output.zip")
+                    f.writestr(f"fixed_{item['name']}", img_io.getvalue())
+            st.download_button("💾 下载全部结果", buf.getvalue(), "output_fixed.zip")
 else:
-    st.info("👈 请在左侧上传参考图，然后在上方上传待处理的照片。")
+    st.warning("👈 请先确保已上传参考图和待处理照片。")
